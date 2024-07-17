@@ -12,59 +12,45 @@ import (
 
 var errUnsubscribed = errors.New("peer unsubscribed")
 
-type sendSubscription struct {
+type localTrackSender struct {
 	logger    *slog.Logger
 	cancelCtx context.CancelFunc
 	cancelWG  sync.WaitGroup
 	ctx       context.Context
 
-	subscriptionIDinTrack   subscriberID
-	subscribeID, trackAlias uint64
-	namespace, trackname    string
-	conn                    Connection
-	objectCh                chan Object
-	trackHeaderStream       *trackHeaderStream
-	groupHeaderStreams      map[uint64]*groupHeaderStream
+	conn               Connection
+	subscription       *Subscription
+	track              LocalTrack
+	trackHeaderStream  *trackHeaderStream
+	groupHeaderStreams map[uint64]*groupHeaderStream
 }
 
-func newSendSubscription(conn Connection, subscribeID, trackAlias uint64, namespace, trackname string) *sendSubscription {
+func newLocalTrackSender(conn Connection, s *Subscription, track LocalTrack) *localTrackSender {
 	ctx, cancelCtx := context.WithCancel(context.Background())
-	sub := &sendSubscription{
-		logger: defaultLogger.WithGroup("MOQ_SEND_SUBSCRIPTION").With(
-			"namespace", namespace,
-			"trackname", trackname,
-		),
-		cancelCtx:             cancelCtx,
-		cancelWG:              sync.WaitGroup{},
-		ctx:                   ctx,
-		subscriptionIDinTrack: -1,
-		subscribeID:           subscribeID,
-		trackAlias:            trackAlias,
-		namespace:             namespace,
-		trackname:             trackname,
-		conn:                  conn,
-		objectCh:              make(chan Object, 1024),
-		trackHeaderStream:     nil,
-		groupHeaderStreams:    map[uint64]*groupHeaderStream{},
+	sender := &localTrackSender{
+		logger:             defaultLogger.WithGroup("MOQ_SEND_SUBSCRIPTION").With("namespace", s.Namespace, "trackname", s.Trackname),
+		cancelCtx:          cancelCtx,
+		cancelWG:           sync.WaitGroup{},
+		ctx:                ctx,
+		conn:               conn,
+		subscription:       s,
+		track:              track,
+		trackHeaderStream:  nil,
+		groupHeaderStreams: map[uint64]*groupHeaderStream{},
 	}
-	sub.cancelWG.Add(1)
-	go sub.loop()
-	return sub
+	sender.cancelWG.Add(1)
+	go sender.loop()
+	return sender
 }
 
-func (s *sendSubscription) loop() {
+func (s *localTrackSender) loop() {
 	defer s.cancelWG.Done()
-	for {
-		select {
-		case o := <-s.objectCh:
-			s.sendObject(o)
-		case <-s.ctx.Done():
-			return
-		}
+	for o := range s.track.IterUntilClosed(s.ctx) {
+		s.sendObject(o)
 	}
 }
 
-func (s *sendSubscription) sendObject(o Object) {
+func (s *localTrackSender) sendObject(o Object) {
 	s.logger.Info("sending object", "group-id", o.GroupID, "object-id", o.ObjectID)
 	switch o.ForwardingPreference {
 	case ObjectForwardingPreferenceDatagram:
@@ -86,22 +72,11 @@ func (s *sendSubscription) sendObject(o Object) {
 	}
 }
 
-func (s *sendSubscription) WriteObject(o Object) error {
-	select {
-	case s.objectCh <- o:
-	case <-s.ctx.Done():
-		return errUnsubscribed
-	default:
-		s.logger.Warn("send subscription dropped object", "group-id", o.GroupID, "object-id", o.ObjectID)
-	}
-	return nil
-}
-
-func (s *sendSubscription) sendDatagram(o Object) error {
+func (s *localTrackSender) sendDatagram(o Object) error {
 	om := &wire.ObjectMessage{
 		Type:              wire.ObjectDatagramMessageType,
-		SubscribeID:       s.subscribeID,
-		TrackAlias:        s.trackAlias,
+		SubscribeID:       s.subscription.ID,
+		TrackAlias:        s.subscription.TrackAlias,
 		GroupID:           o.GroupID,
 		ObjectID:          o.ObjectID,
 		PublisherPriority: o.PublisherPriority,
@@ -117,12 +92,12 @@ func (s *sendSubscription) sendDatagram(o Object) error {
 	return nil
 }
 
-func (s *sendSubscription) sendObjectStream(o Object) error {
+func (s *localTrackSender) sendObjectStream(o Object) error {
 	stream, err := s.conn.OpenUniStream()
 	if err != nil {
 		return err
 	}
-	os, err := newObjectStream(stream, s.subscribeID, s.trackAlias, o.GroupID, o.ObjectID, o.PublisherPriority)
+	os, err := newObjectStream(stream, s.subscription.ID, s.subscription.TrackAlias, o.GroupID, o.ObjectID, o.PublisherPriority)
 	if err != nil {
 		return err
 	}
@@ -132,13 +107,13 @@ func (s *sendSubscription) sendObjectStream(o Object) error {
 	return os.Close()
 }
 
-func (s *sendSubscription) sendTrackHeaderStream(o Object) error {
+func (s *localTrackSender) sendTrackHeaderStream(o Object) error {
 	if s.trackHeaderStream == nil {
 		stream, err := s.conn.OpenUniStream()
 		if err != nil {
 			return err
 		}
-		ts, err := newTrackHeaderStream(stream, s.subscribeID, s.trackAlias, o.PublisherPriority)
+		ts, err := newTrackHeaderStream(stream, s.subscription.ID, s.subscription.TrackAlias, o.PublisherPriority)
 		if err != nil {
 			return err
 		}
@@ -148,7 +123,7 @@ func (s *sendSubscription) sendTrackHeaderStream(o Object) error {
 	return err
 }
 
-func (s *sendSubscription) sendGroupHeaderStream(o Object) error {
+func (s *localTrackSender) sendGroupHeaderStream(o Object) error {
 	gs, ok := s.groupHeaderStreams[o.GroupID]
 	if !ok {
 		var stream SendStream
@@ -157,7 +132,7 @@ func (s *sendSubscription) sendGroupHeaderStream(o Object) error {
 		if err != nil {
 			return err
 		}
-		gs, err = newGroupHeaderStream(stream, s.subscribeID, s.trackAlias, o.GroupID, o.PublisherPriority)
+		gs, err = newGroupHeaderStream(stream, s.subscription.ID, s.subscription.TrackAlias, o.GroupID, o.PublisherPriority)
 		if err != nil {
 			return err
 		}
@@ -167,7 +142,7 @@ func (s *sendSubscription) sendGroupHeaderStream(o Object) error {
 	return err
 }
 
-func (s *sendSubscription) Close() error {
+func (s *localTrackSender) Close() error {
 	s.cancelCtx()
 	s.cancelWG.Wait()
 	return nil
